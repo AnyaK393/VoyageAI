@@ -14,7 +14,16 @@ def load_freight_data(path: Path | None = None) -> tuple[pd.DataFrame, str]:
         missing = required - set(frame.columns)
         if missing:
             raise ValueError(f"Freight CSV missing columns: {sorted(missing)}")
-        for name, default in {"bunker_usd_per_tonne": 620.0, "congestion_days": 1.8}.items():
+        # These defaults keep a minimal historic-rate CSV usable, while exposing
+        # the market and operational inputs used by the prototype model.
+        for name, default in {
+            "bunker_usd_per_tonne": 620.0,
+            "coal_price_usd_per_tonne": 105.0,
+            "usd_inr": 83.0,
+            "congestion_days": 1.8,
+            "route_distance_nm": 2400.0,
+            "vessel_class_code": 1.0,
+        }.items():
             if name not in frame:
                 frame[name] = default
         return frame.reset_index(drop=True), f"CSV: {source.name}"
@@ -27,8 +36,15 @@ def load_freight_data(path: Path | None = None) -> tuple[pd.DataFrame, str]:
     rate = 15.5 + trend + seasonal + shocks
     bunker = 590 + 24 * np.sin(np.arange(len(index)) * 2 * np.pi / 40) + rng.normal(0, 8, len(index))
     congestion = np.maximum(0.3, 1.4 + 0.45 * np.sin(np.arange(len(index)) * 2 * np.pi / 18) + rng.normal(0, .18, len(index)))
+    coal = 102 + 6 * np.sin(np.arange(len(index)) * 2 * np.pi / 34) + rng.normal(0, 1.6, len(index))
+    fx = 82.5 + np.linspace(0, 1.0, len(index)) + rng.normal(0, .18, len(index))
+    month = index.month
+    monsoon = ((month >= 6) & (month <= 9)).astype(int)
     return pd.DataFrame({"date": index, "route": "Indonesia–Paradip", "rate_usd_per_tonne": rate.round(2),
-                         "bunker_usd_per_tonne": bunker.round(1), "congestion_days": congestion.round(2)}), "Deterministic proxy data (demo only)"
+                         "bunker_usd_per_tonne": bunker.round(1), "coal_price_usd_per_tonne": coal.round(2),
+                         "usd_inr": fx.round(2), "congestion_days": congestion.round(2),
+                         "route_distance_nm": 2400.0, "vessel_class_code": 1.0,
+                         "monsoon_indicator": monsoon}), "Deterministic proxy data (demo only)"
 
 
 def ports() -> pd.DataFrame:

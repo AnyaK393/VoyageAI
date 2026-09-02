@@ -22,3 +22,14 @@ class CoreTest(unittest.TestCase):
         data, _ = load_freight_data()
         options = contract_options(forecast(data, 12), vessels().iloc[0], 58000)
         self.assertEqual(len(options), 3)
+
+    def test_bunker_scenario_changes_forecast_and_contract_costs(self):
+        data, _ = load_freight_data()
+        vessel = vessels().iloc[0]
+        base_forecast = forecast(data, 12)
+        stressed_forecast = forecast(data, 12, {"bunker_pct": 15})
+        self.assertFalse(base_forecast["bunker_usd_per_tonne"].equals(stressed_forecast["bunker_usd_per_tonne"]))
+        base_options = contract_options(base_forecast, vessel, 58000)
+        stressed_options = contract_options(stressed_forecast, vessel, 58000, scenario={"bunker_pct": 15})
+        self.assertGreater(stressed_options["all_in_usd_per_tonne"].min(), base_options["all_in_usd_per_tonne"].min())
+        self.assertGreater(stressed_options["risk_allowance_usd"].max(), 0)
