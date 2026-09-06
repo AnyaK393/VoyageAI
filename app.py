@@ -10,7 +10,101 @@ from maritime_ai.decision import (
     risk_score,
     find_decision_flip,
 )
-from maritime_ai.forecast import backtest, forecast
+from maritime_ai.forecast import backtest, forecast, FEATURES, make_features, make_model
+
+
+# ============================================================
+# DECISION TRACE / MODEL AUDIT HELPERS
+# ============================================================
+
+MODEL_NAME = "XGBoost"
+MODEL_VERSION = "XGBoost-v1.0"
+
+
+def build_model_audit(frame: pd.DataFrame, selected_model: str) -> dict:
+    """Fit the selected production model and expose transparent feature importance.
+
+    Ridge uses coefficient × feature standard deviation. XGBoost uses its native
+    gain-based feature importance. Both are model explanations, not causal claims.
+    """
+    featured = make_features(frame)
+    if featured.empty:
+        return {
+            "model": selected_model,
+            "version": "Unknown",
+            "top_features": [],
+            "n_training_rows": 0,
+        }
+
+    model = make_model(selected_model).fit(
+        featured[FEATURES],
+        featured["rate_usd_per_tonne"],
+    )
+
+    if selected_model == "XGBoost":
+        importance = np.asarray(model.feature_importances_, dtype=float)
+        impact = pd.DataFrame({
+            "feature": FEATURES,
+            "importance": importance,
+        }).sort_values("importance", ascending=False)
+        top = impact.head(6).to_dict("records")
+    else:
+        x = featured[FEATURES]
+        std = x.std().replace(0, np.nan).fillna(1.0)
+        scaled = np.asarray(model.coef_, dtype=float) * std.values
+        impact = pd.DataFrame({
+            "feature": FEATURES,
+            "importance": np.abs(scaled),
+            "signed_impact": scaled,
+        }).sort_values("importance", ascending=False)
+        top = impact.head(6).to_dict("records")
+
+    version = "XGBoost-v1.0" if selected_model == "XGBoost" else "Ridge-v1.0"
+    return {
+        "model": selected_model,
+        "version": version,
+        "top_features": top,
+        "n_training_rows": len(featured),
+    }
+
+
+def decision_trace(
+    winner: pd.Series,
+    forecast_frame: pd.DataFrame,
+    metrics: dict,
+    vessel: pd.Series,
+    feasible_result: dict,
+    score: int,
+    label: str,
+    congestion: float,
+    model_audit: dict,
+    thresholds: dict,
+) -> dict:
+    """Create a compact audit object explaining the decision path."""
+    vessel_name_str = vessel["vessel"] if "vessel" in vessel else getattr(vessel, "name", "Unknown Vessel")
+    vessel_class_str = vessel["class"] if "class" in vessel else vessel.get("vessel_class", "Unknown Class")
+
+    return {
+        "model": model_audit["model"],
+        "model_version": model_audit["version"],
+        "forecast_mean": float(forecast_frame["rate_usd_per_tonne"].mean()),
+        "forecast_first": float(forecast_frame["rate_usd_per_tonne"].iloc[0]),
+        "forecast_last": float(forecast_frame["rate_usd_per_tonne"].iloc[-1]),
+        "walk_forward_mae": float(metrics["mae"]),
+        "walk_forward_rmse": float(metrics["rmse"]),
+        "backtest_points": int(metrics["n_predictions"]),
+        "top_features": model_audit["top_features"],
+        "vessel": str(vessel_name_str),
+        "vessel_class": str(vessel_class_str),
+        "feasibility_checks": feasible_result["checks"],
+        "contract": str(winner["contract"]),
+        "all_in_usd_per_tonne": float(winner["all_in_usd_per_tonne"]),
+        "saving_vs_spot_usd": float(winner["saving_vs_spot_usd"]),
+        "risk_score": int(score),
+        "risk_label": label,
+        "congestion_days": float(congestion),
+        "thresholds": thresholds,
+    }
 
 
 # ============================================================
@@ -326,6 +420,8 @@ scenario = {
 # ============================================================
 
 metrics = backtest(data)
+selected_model = metrics["selected_model"]
+model_audit = build_model_audit(data, selected_model)
 
 
 # ============================================================
@@ -433,10 +529,9 @@ def optimize_scenario(
         data,
         horizon,
         driver_changes=test_scenario,
+        model_name=selected_model,
     )
 
-    # Explicit market shock applied after the model forecast.
-    # This represents a scenario change in the freight market.
     freight_change = (
         test_scenario.get("freight_pct", 0) / 100
     )
@@ -488,10 +583,6 @@ winner = all_options.iloc[0]
 # BASELINE SCENARIO
 # ============================================================
 
-# No market shock.
-# This is used only as the comparison point for the
-# What-If Decision Flip feature.
-
 base_forecast_frame, base_options = optimize_scenario({})
 
 base_winner = base_options.iloc[0]
@@ -503,11 +594,7 @@ base_winner = base_options.iloc[0]
 
 vessel_name = winner["vessel"]
 
-vessel = (
-    eligible_vessels
-    .set_index("vessel")
-    .loc[vessel_name]
-)
+vessel = eligible_vessels[eligible_vessels["vessel"] == vessel_name].iloc[0]
 
 feasible_result = feasibility(
     port,
@@ -538,6 +625,45 @@ score, label = risk_score(
 
 
 # ============================================================
+# DECISION FLIP THRESHOLDS — COMPUTED BEFORE ALL TABS
+# ============================================================
+
+def run_for_threshold(test_scenario):
+    _, test_options = optimize_scenario(test_scenario)
+    return test_options.iloc[0]
+
+
+bunker_flip, bunker_winner = find_decision_flip(
+    run_for_threshold, {}, "bunker_pct", max_stress=60, step=1
+)
+freight_flip, freight_winner = find_decision_flip(
+    run_for_threshold, {}, "freight_pct", max_stress=40, step=1
+)
+congestion_flip, congestion_winner = find_decision_flip(
+    run_for_threshold, {}, "congestion_days", max_stress=7, step=0.25
+)
+
+threshold_summary = {
+    "bunker_price": bunker_flip,
+    "freight_market": freight_flip,
+    "port_congestion_days": congestion_flip,
+}
+
+trace = decision_trace(
+    winner=winner,
+    forecast_frame=forecast_frame,
+    metrics=metrics,
+    vessel=vessel,
+    feasible_result=feasible_result,
+    score=score,
+    label=label,
+    congestion=congestion,
+    model_audit=model_audit,
+    thresholds=threshold_summary,
+)
+
+
+# ============================================================
 # CURRENT WINNER OPTIONS
 # ============================================================
 
@@ -559,8 +685,6 @@ fallbacks = (
 )
 
 
-# Demo FX conversion.
-# Keep this unchanged for the prototype.
 inr_rate = 83.0
 
 
@@ -760,7 +884,7 @@ with overview_tab:
                     "Saving vs spot ($)": "${:,.0f}",
                 }
             ),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
@@ -832,7 +956,7 @@ with overview_tab:
                     "Saving vs spot ($)": "${:,.0f}",
                 }
             ),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
@@ -882,7 +1006,7 @@ with overview_tab:
 
         st.dataframe(
             source_table,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
@@ -896,8 +1020,10 @@ with market_tab:
     st.subheader("Freight outlook")
 
     st.caption(
-        f"Ridge Regression using rate lags, recent average, "
-        f"bunker proxy and congestion proxy. Data: {provenance}."
+        f"{selected_model} selected after walk-forward comparison "
+        f"against the Ridge baseline. Features include rate lags, "
+        f"recent average, bunker, coal, FX and congestion proxies. "
+        f"Data: {provenance}."
     )
 
     chart_data = pd.concat(
@@ -1007,7 +1133,7 @@ with fleet_tab:
 
     st.dataframe(
         pd.DataFrame(feasibility_rows),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -1121,11 +1247,6 @@ with contract_tab:
         f"₹{inr_rate:.0f}/USD."
     )
 
-
-    # ========================================================
-    # EXISTING SCENARIO WARNING
-    # ========================================================
-
     if any(
         float(value) != 0
         for value in scenario.values()
@@ -1140,11 +1261,6 @@ with contract_tab:
             f"congestion +{congestion_shock} days, "
             f"cargo {cargo_change:+d}%."
         )
-
-
-    # ========================================================
-    # 🔄 WHAT-IF DECISION FLIP
-    # ========================================================
 
     st.markdown("---")
 
@@ -1200,14 +1316,9 @@ with contract_tab:
                 "All-in cost ($/t)": "${:.2f}",
             }
         ),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
-
-
-    # ========================================================
-    # DECISION FLIPPED
-    # ========================================================
 
     if scenario_active:
 
@@ -1301,6 +1412,124 @@ with risk_tab:
 
     st.subheader("Risk and hedge guidance")
 
+    st.markdown("### 🔎 Decision traceability")
+    st.caption(
+        "Every recommendation is traceable through the same decision path: "
+        "Data → Features → Model → Forecast → Vessel feasibility → Cost → Risk → Decision."
+    )
+
+    trace_cols = st.columns(5)
+    trace_cols[0].metric("Model", trace["model"])
+    trace_cols[1].metric("Forecast", f"${trace['forecast_mean']:.2f}/t")
+    trace_cols[2].metric("MAE", f"${trace['walk_forward_mae']:.2f}/t")
+    trace_cols[3].metric("Vessel", trace["vessel"])
+    trace_cols[4].metric("Contract", trace["contract"])
+
+    with st.expander("🔎 Open full decision trace — why did VoyageAI choose this?", expanded=True):
+        st.caption(
+            "This audit follows the actual pipeline used by the prototype: "
+            "data → features → model → forecast → feasibility → cost → risk → recommendation."
+        )
+
+        t1, t2, t3 = st.columns(3)
+        t1.metric("Selected model", trace["model"])
+        t2.metric("Model version", trace["model_version"])
+        t3.metric("Backtest points", trace["backtest_points"])
+
+        st.markdown("**1. Forecast evidence**")
+        f1, f2, f3 = st.columns(3)
+        f1.metric("Forecast average", f"${trace['forecast_mean']:.2f}/t")
+        f2.metric("Walk-forward MAE", f"${trace['walk_forward_mae']:.2f}/t")
+        f3.metric("Walk-forward RMSE", f"${trace['walk_forward_rmse']:.2f}/t")
+
+        st.markdown("**Model selection — Ridge baseline vs XGBoost**")
+        comparison_display = metrics["comparison"].copy()
+        comparison_display["MAE"] = comparison_display["MAE"].map(lambda x: f"${x:.2f}/t")
+        comparison_display["RMSE"] = comparison_display["RMSE"].map(lambda x: f"${x:.2f}/t")
+        comparison_display["Status"] = comparison_display["Model"].map(
+            lambda x: "✓ Selected" if x == trace["model"] else "Baseline"
+        )
+        st.dataframe(comparison_display, width="stretch", hide_index=True)
+        st.caption("Selection rule: lowest walk-forward MAE; RMSE breaks a tie. The selected model is then used for the forecast and downstream decision engine.")
+
+        st.markdown("**2. Model drivers**")
+        driver_rows = []
+        for item in trace["top_features"]:
+            row = {
+                "Feature": item["feature"],
+                "Importance": item["importance"],
+            }
+            if "signed_impact" in item:
+                row["Signed impact"] = item["signed_impact"]
+            driver_rows.append(row)
+        if driver_rows:
+            st.dataframe(
+                pd.DataFrame(driver_rows).style.format(
+                    {
+                        "Importance": "{:.4f}",
+                        "Signed impact": "{:+.3f}",
+                    }
+                ),
+                width="stretch",
+                hide_index=True,
+            )
+        st.caption(
+            "For XGBoost, importance ranks how strongly the fitted tree model uses each feature. "
+            "For Ridge, importance is coefficient × feature scale. "
+            "These are model explanations, not proof of causality."
+        )
+
+        st.markdown("**3. Vessel feasibility gate**")
+        feasibility_trace = pd.DataFrame(
+            [
+                {"Constraint": rule, "Result": "PASS" if passed else "FAIL"}
+                for rule, passed in trace["feasibility_checks"].items()
+            ]
+        )
+        st.dataframe(feasibility_trace, width="stretch", hide_index=True)
+
+        st.markdown("**4. Economic decision**")
+        e1, e2, e3 = st.columns(3)
+        e1.metric("Selected vessel", trace["vessel"])
+        e2.metric("Selected contract", trace["contract"])
+        e3.metric("All-in cost", f"${trace['all_in_usd_per_tonne']:.2f}/t")
+        st.write(
+            f"The optimizer selected **{trace['contract']} + {trace['vessel']}** "
+            f"because it had the lowest expected all-in cost among feasible combinations, "
+            f"with an estimated saving of **${trace['saving_vs_spot_usd']:,.0f}** versus the "
+            "spot baseline used by this prototype."
+        )
+
+        st.markdown("**5. Risk and stability**")
+        st.write(
+            f"Risk signal: **{trace['risk_label']} ({trace['risk_score']}/100)**, "
+            f"with approximately **{trace['congestion_days']:.1f} congestion days** in the forecast scenario."
+        )
+
+        threshold_rows_trace = []
+        for variable, threshold in trace["thresholds"].items():
+            if threshold is None:
+                display = "No flip in tested range"
+            elif variable == "port_congestion_days":
+                display = f"+{threshold:.2f} days"
+            else:
+                display = f"+{threshold:.1f}%"
+            threshold_rows_trace.append(
+                {"Stress variable": variable, "Approx. flip threshold": display}
+            )
+
+        st.dataframe(
+            pd.DataFrame(threshold_rows_trace),
+            width="stretch",
+            hide_index=True,
+        )
+
+        st.caption(
+            f"Traceability chain: Data → Features → Ridge baseline vs XGBoost → "
+            f"{trace['model']} forecast → Vessel gate → Cost optimizer → Risk → "
+            "Contract recommendation → Flip threshold."
+        )
+
     gauge, risk_detail = st.columns(
         [.55, 1.45]
     )
@@ -1361,11 +1590,6 @@ with risk_tab:
             SOURCE_PORTS[origin]["season"],
         )
 
-
-    # ========================================================
-    # COMPONENT RISKS
-    # ========================================================
-
     st.markdown("#### Component risks")
 
     market_component = min(
@@ -1422,11 +1646,6 @@ with risk_tab:
         y_label="Risk contribution (0–100)",
     )
 
-
-    # ========================================================
-    # HEDGE GUIDANCE
-    # ========================================================
-
     hedge_message = {
         "Conservative": (
             "Protect price exposure: request a fixed "
@@ -1448,11 +1667,6 @@ with risk_tab:
     st.success(
         f"**{risk_appetite} policy:** {hedge_message}"
     )
-
-
-    # ========================================================
-    # WHY VOYAGEAI RECOMMENDS THIS
-    # ========================================================
 
     st.markdown("#### Why VoyageAI recommends this")
 
@@ -1478,11 +1692,6 @@ with risk_tab:
         "A real deployment needs approved limits and live market data."
     )
 
-
-    # ========================================================
-    # 🎯 DECISION THRESHOLD ENGINE
-    # ========================================================
-
     st.markdown("---")
 
     st.markdown(
@@ -1494,53 +1703,6 @@ with risk_tab:
         "forecast → cost → optimizer pipeline to find "
         "the stress level where the current decision changes."
     )
-
-
-    # --------------------------------------------------------
-    # Threshold runner
-    # --------------------------------------------------------
-
-    def run_for_threshold(test_scenario):
-
-        _, test_options = optimize_scenario(
-            test_scenario
-        )
-
-        return test_options.iloc[0]
-
-
-    # --------------------------------------------------------
-    # Find thresholds from BASELINE
-    # --------------------------------------------------------
-
-    bunker_flip, bunker_winner = find_decision_flip(
-        run_for_threshold,
-        {},
-        "bunker_pct",
-        max_stress=60,
-        step=1,
-    )
-
-    freight_flip, freight_winner = find_decision_flip(
-        run_for_threshold,
-        {},
-        "freight_pct",
-        max_stress=40,
-        step=1,
-    )
-
-    congestion_flip, congestion_winner = find_decision_flip(
-        run_for_threshold,
-        {},
-        "congestion_days",
-        max_stress=7,
-        step=0.25,
-    )
-
-
-    # ========================================================
-    # THRESHOLD TABLE
-    # ========================================================
 
     threshold_rows = [
         [
@@ -1584,7 +1746,6 @@ with risk_tab:
         ],
     ]
 
-
     st.dataframe(
         pd.DataFrame(
             threshold_rows,
@@ -1594,14 +1755,9 @@ with risk_tab:
                 "New decision",
             ],
         ),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
-
-
-    # ========================================================
-    # FIND FIRST BREAKING POINT
-    # ========================================================
 
     flip_candidates = [
         (
@@ -1621,13 +1777,11 @@ with risk_tab:
         ),
     ]
 
-
     valid_flips = [
         item
         for item in flip_candidates
         if item[1] is not None
     ]
-
 
     if valid_flips:
 
@@ -1663,11 +1817,4 @@ with risk_tab:
             the actual forecast → cost → optimizer pipeline,
             not from a UI-only rule.
             """
-        )
-
-    else:
-
-        st.success(
-            "🟢 **Stable decision:** no decision flip was "
-            "detected within the tested stress ranges."
         )
