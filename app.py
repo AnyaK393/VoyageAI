@@ -2,6 +2,9 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from datetime import date, timedelta
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from maritime_ai.data import CARGO_TYPES, feasible_berths, load_freight_data, ports, vessels
 from maritime_ai.decision import (
@@ -277,7 +280,10 @@ data, provenance = load_freight_data()
 port_table = ports()
 vessel_table = vessels()
 database = Database()
-database.initialize()
+try:
+    database.seed_all_defaults()
+except Exception:
+    database.initialize()
 
 
 # ============================================================
@@ -876,6 +882,26 @@ with overview_tab:
               laycan before award.
             """
         )
+
+        col_save1, col_save2 = st.columns([1, 1])
+        with col_save1:
+            if st.button("💾 Save Decision to Database", key="btn_save_overview", type="primary", use_container_width=True):
+                database.save_recommendation(
+                    destination_port=port_name,
+                    cargo_tonnes=analysis_cargo,
+                    horizon_weeks=horizon,
+                    model_name=selected_model,
+                    vessel=vessel_name,
+                    contract=winner["contract"],
+                    all_in_usd_per_tonne=float(winner["all_in_usd_per_tonne"]),
+                    risk_score=score,
+                    risk_label=label,
+                    scenario=scenario,
+                    origin_port=origin,
+                    saving_vs_spot_usd=float(winner.get("saving_vs_spot_usd", 0.0)),
+                    vessel_class=str(vessel.get("class", "")),
+                )
+                st.success("Decision recorded to database audit trail!")
 
         st.subheader("Contract choices")
 
@@ -1906,14 +1932,107 @@ with tender_tab:
 
 with operations_tab:
 
-    st.subheader("System operations")
-    st.caption("Data lineage, model governance, recommendation audit trail and decision alerts.")
+    st.subheader("System operations & Database (Supabase)")
+    st.caption("Data lineage, model governance, Supabase persistent audit trail and decision alerts.")
 
-    db_kind = "PostgreSQL" if database.url.startswith("postgresql") else "SQLite demo database"
-    o1, o2, o3 = st.columns(3)
-    o1.metric("Backend design", "FastAPI ready", "API service available")
-    o2.metric("Database", db_kind, "Persistent local history enabled")
-    o3.metric("Master data", f"{len(data):,} weeks", f"Latest: {data['date'].max():%d %b %Y}")
+    counts = database.get_table_counts()
+    db_kind = database.database_type_display
+
+    o1, o2, o3, o4 = st.columns(4)
+    o1.metric("Database", db_kind, "Supabase Ready" if database.is_supabase_or_postgres else "Local SQLite")
+    o2.metric("Market Data", f"{counts['market_observations']:,} rows", f"Latest: {data['date'].max():%d %b %Y}")
+    o3.metric("Saved Decisions", f"{counts['recommendations']:,} records", "Audit Trail")
+    o4.metric("Broker Tenders", f"{counts['broker_tenders']:,} quotes", "Tender Desk")
+
+    # Supabase Database Sync Action Bar
+    st.markdown("### ⚡ Supabase Data Persistence & Sync")
+    st.caption("Synchronize master data, ports, vessel fleet, model evaluations, and decision scenarios directly to Supabase.")
+
+    col_btn1, col_btn2 = st.columns([1.2, 1.2])
+    with col_btn1:
+        if st.button("💾 Save Current Decision & Alerts", key="save_current_decision_ops", type="primary", use_container_width=True):
+            database.save_recommendation(
+                destination_port=port_name,
+                cargo_tonnes=analysis_cargo,
+                horizon_weeks=horizon,
+                model_name=selected_model,
+                vessel=vessel_name,
+                contract=winner["contract"],
+                all_in_usd_per_tonne=float(winner["all_in_usd_per_tonne"]),
+                risk_score=score,
+                risk_label=label,
+                scenario=scenario,
+                origin_port=origin,
+                saving_vs_spot_usd=float(winner.get("saving_vs_spot_usd", 0.0)),
+                vessel_class=str(vessel.get("class", "")),
+            )
+            for row in metrics["comparison"].to_dict("records"):
+                with database.session() as session:
+                    session.add(ModelRun(
+                        model_name=row["Model"], version=row["Version"], mae=float(row["MAE"]),
+                        rmse=float(row["RMSE"]), training_rows=len(make_features(data)),
+                        status="ACTIVE" if row["Model"] == selected_model else "TESTED",
+                    ))
+                    session.commit()
+            database.save_alerts(active_alerts)
+            st.success("Current recommendation, model benchmarks, and alerts saved to Supabase database!")
+            st.rerun()
+
+    with col_btn2:
+        if st.button("🚀 Sync All Ports & Scenarios to Database", key="sync_all_ports_ops", use_container_width=True):
+            with st.spinner("Generating and uploading optimization decisions across all ports & scenarios..."):
+                from maritime_ai.service import optimize_charter
+                database.seed_all_defaults()
+                test_ports = ["Paradip", "Vizag", "Gangavaram", "Gopalpur", "Dhamra"]
+                test_scenarios = [
+                    {"name": "Baseline", "scenario": {}},
+                    {"name": "Bunker Surge (+15%)", "scenario": {"bunker_pct": 15}},
+                    {"name": "Freight Spike (+20%)", "scenario": {"freight_pct": 20}},
+                    {"name": "Monsoon Congestion (+3d)", "scenario": {"congestion_days": 3}},
+                ]
+                added_recs = 0
+                for p in test_ports:
+                    for sc in test_scenarios:
+                        try:
+                            res = optimize_charter(p, 58000, 12, sc["scenario"], data=data, metric=metrics)
+                            w = res["recommendation"]
+                            database.save_recommendation(
+                                destination_port=p,
+                                cargo_tonnes=58000,
+                                horizon_weeks=12,
+                                model_name=res["model"],
+                                vessel=w["vessel"],
+                                vessel_class=w.get("vessel_class", ""),
+                                contract=w["contract"],
+                                all_in_usd_per_tonne=w["all_in_usd_per_tonne"],
+                                saving_vs_spot_usd=w.get("saving_vs_spot_usd", 0.0),
+                                risk_score=w["risk_score"],
+                                risk_label=w["risk_label"],
+                                scenario={"scenario_name": sc["name"], **sc["scenario"]},
+                                origin_port="Indonesia",
+                            )
+                            added_recs += 1
+                        except Exception:
+                            pass
+                database.save_alerts(active_alerts)
+                st.success(f"Successfully synced master data, fleet, and {added_recs} decision scenarios to Supabase!")
+                st.rerun()
+
+    # Database Table Metrics Card
+    with st.expander("📊 Database Tables Status & Row Counts", expanded=True):
+        st.markdown(
+            f"""
+            | Supabase / SQL Table | Description | Current Row Count |
+            | :--- | :--- | :--- |
+            | `market_observations` | Master weekly freight, bunker, coal, FX data | **{counts['market_observations']:,}** rows |
+            | `ports` | Destination ports draft, beam & DWT constraints | **{counts['ports']:,}** rows |
+            | `vessels` | Fleet vessel specifications and fuel factors | **{counts['vessels']:,}** rows |
+            | `model_runs` | AI model evaluation metrics (MAE, RMSE, Version) | **{counts['model_runs']:,}** rows |
+            | `recommendations` | Persistent voyage optimization recommendations | **{counts['recommendations']:,}** rows |
+            | `broker_tenders` | Submitted broker tenders & commercial quotes | **{counts['broker_tenders']:,}** rows |
+            | `alerts` | Risk, decision-flip and data quality alerts | **{counts['alerts']:,}** rows |
+            """
+        )
 
     st.markdown("### Data health")
     source_status = pd.DataFrame(
@@ -1953,35 +2072,22 @@ with operations_tab:
     st.dataframe(pd.DataFrame(active_alerts, columns=["Category", "Severity", "Alert"]), width="stretch", hide_index=True)
 
     st.markdown("### Recommendation audit trail")
-    st.caption("Save the current recommendation to create a persistent, timestamped decision record.")
-    if st.button("Save current recommendation and alerts", type="primary"):
-        with database.session() as session:
-            for row in metrics["comparison"].to_dict("records"):
-                session.add(ModelRun(
-                    model_name=row["Model"], version=row["Version"], mae=float(row["MAE"]),
-                    rmse=float(row["RMSE"]), training_rows=len(make_features(data)),
-                    status="ACTIVE" if row["Model"] == selected_model else "TESTED",
-                ))
-            session.add(Recommendation(
-                destination_port=port_name, cargo_tonnes=analysis_cargo, horizon_weeks=horizon,
-                model_name=selected_model, vessel=vessel_name, contract=winner["contract"],
-                all_in_usd_per_tonne=float(winner["all_in_usd_per_tonne"]), risk_score=score,
-                risk_label=label, scenario_json=pd.Series(scenario).to_json(),
-            ))
-            for category, severity, message in active_alerts:
-                session.add(Alert(category=category, severity=severity, message=message))
-            session.commit()
-        st.success("Recommendation, model evaluation and current alerts were saved to the audit database.")
+    st.caption("Saved decisions in Supabase database.")
 
     with database.session() as session:
-        saved_recommendations = session.scalars(select(Recommendation).order_by(desc(Recommendation.created_at)).limit(10)).all()
-        saved_alerts = session.scalars(select(Alert).order_by(desc(Alert.created_at)).limit(10)).all()
+        saved_recommendations = session.scalars(select(Recommendation).order_by(desc(Recommendation.created_at)).limit(20)).all()
+        saved_alerts = session.scalars(select(Alert).order_by(desc(Alert.created_at)).limit(20)).all()
 
     if saved_recommendations:
         history = pd.DataFrame([
-            {"Created": item.created_at, "Port": item.destination_port, "Cargo (t)": item.cargo_tonnes,
-             "Model": item.model_name, "Vessel": item.vessel, "Contract": item.contract,
-             "All-in ($/t)": item.all_in_usd_per_tonne, "Risk": f"{item.risk_label} · {item.risk_score}/100"}
+            {"Created": item.created_at.strftime("%Y-%m-%d %H:%M") if hasattr(item.created_at, "strftime") else str(item.created_at),
+             "Port": item.destination_port,
+             "Cargo (t)": item.cargo_tonnes,
+             "Model": item.model_name,
+             "Vessel": item.vessel,
+             "Contract": item.contract,
+             "All-in ($/t)": item.all_in_usd_per_tonne,
+             "Risk": f"{item.risk_label} · {item.risk_score}/100"}
             for item in saved_recommendations
         ])
         st.dataframe(history.style.format({"Cargo (t)": "{:,.0f}", "All-in ($/t)": "${:.2f}"}), width="stretch", hide_index=True)
@@ -1991,6 +2097,9 @@ with operations_tab:
     if saved_alerts:
         with st.expander("Saved alert history"):
             st.dataframe(pd.DataFrame([
-                {"Created": item.created_at, "Category": item.category, "Severity": item.severity, "Alert": item.message}
+                {"Created": item.created_at.strftime("%Y-%m-%d %H:%M") if hasattr(item.created_at, "strftime") else str(item.created_at),
+                 "Category": item.category,
+                 "Severity": item.severity,
+                 "Alert": item.message}
                 for item in saved_alerts
             ]), width="stretch", hide_index=True)

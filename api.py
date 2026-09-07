@@ -51,18 +51,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        database.initialize()
-        frame, _ = load_freight_data()
-        with database.session() as session:
-            if database.market_count() == 0:
-                for row in frame.itertuples(index=False):
-                    session.add(MarketObservation(
-                        observation_date=row.date.to_pydatetime(), freight_proxy_rate=float(row.rate_usd_per_tonne),
-                        bunker_proxy=float(row.bunker_usd_per_tonne), coal_price=float(row.coal_price_usd_per_tonne),
-                        usd_inr=float(row.usd_inr), congestion_days=float(row.congestion_days),
-                        provenance="Supplied VoyageAI master dataset / prototype defaults",
-                    ))
-                session.commit()
+        database.seed_all_defaults()
         yield
 
     app = FastAPI(title="VoyageAI API", version="1.0.0", lifespan=lifespan)

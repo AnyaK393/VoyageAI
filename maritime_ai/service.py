@@ -1,8 +1,9 @@
-"""Shared application service used by FastAPI without changing Streamlit."""
+"""Shared application service used by FastAPI and scripts without changing Streamlit."""
 
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import pandas as pd
 
@@ -16,11 +17,16 @@ def optimize_charter(
     cargo_tonnes: float,
     horizon_weeks: int = 12,
     scenario: dict | None = None,
+    data: pd.DataFrame | None = None,
+    metric: dict[str, Any] | None = None,
 ) -> dict:
     """Run the same forecast → feasibility → optimizer path as the dashboard."""
     scenario = scenario or {}
-    data, provenance = load_freight_data()
-    metric = backtest(data)
+    provenance = ""
+    if data is None:
+        data, provenance = load_freight_data()
+    if metric is None:
+        metric = backtest(data)
     forecast_frame = forecast(data, horizon_weeks, scenario, metric["selected_model"])
     forecast_frame["rate_usd_per_tonne"] *= 1 + scenario.get("freight_pct", 0) / 100
 
@@ -46,7 +52,7 @@ def optimize_charter(
     volatility = float(data["rate_usd_per_tonne"].tail(12).std())
     score, label = risk_score(volatility, float(forecast_frame["congestion_days"].mean()), gate)
     return {
-        "provenance": provenance,
+        "provenance": provenance or "Supplied dataset",
         "model": metric["selected_model"],
         "model_version": metric["selected_version"],
         "backtest": {"mae": metric["mae"], "rmse": metric["rmse"], "points": metric["n_predictions"]},
