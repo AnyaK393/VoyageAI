@@ -6,8 +6,17 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
 
 def load_freight_data(path: Path | None = None) -> tuple[pd.DataFrame, str]:
-    """Load a compatible CSV or a deterministic proxy history for demo/backtests."""
+    """Load supplied master data, an explicitly supplied CSV, or demo fallback.
+
+    The generated master dataset remains labelled as a freight-market proxy. It
+    is intentionally preferred over synthetic history without changing the
+    dashboard's input/output contract.
+    """
     source = path or DATA_DIR / "freight_rates.csv"
+    if path is None and not source.exists():
+        master = DATA_DIR / "processed" / "voyageai_master_weekly.csv"
+        if master.exists():
+            source = master
     if source.exists():
         frame = pd.read_csv(source, parse_dates=["date"]).sort_values("date")
         required = {"date", "rate_usd_per_tonne"}
@@ -26,6 +35,11 @@ def load_freight_data(path: Path | None = None) -> tuple[pd.DataFrame, str]:
         }.items():
             if name not in frame:
                 frame[name] = default
+        if source.name == "voyageai_master_weekly.csv":
+            return frame.reset_index(drop=True), (
+                "Supplied master dataset: Statistics Finland freight index "
+                "proxy + World Bank coal/Brent proxies + USD/INR"
+            )
         return frame.reset_index(drop=True), f"CSV: {source.name}"
 
     index = pd.date_range("2023-01-02", periods=156, freq="W-MON")

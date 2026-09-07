@@ -11,6 +11,8 @@ from maritime_ai.decision import (
     find_decision_flip,
 )
 from maritime_ai.forecast import backtest, forecast, FEATURES, make_features, make_model
+from maritime_ai.database import Alert, Database, ModelRun, Recommendation
+from sqlalchemy import desc, select
 
 
 # ============================================================
@@ -273,6 +275,8 @@ SOURCE_PORTS = {
 data, provenance = load_freight_data()
 port_table = ports()
 vessel_table = vessels()
+database = Database()
+database.initialize()
 
 
 # ============================================================
@@ -820,6 +824,7 @@ m5.metric(
     fleet_tab,
     contract_tab,
     risk_tab,
+    operations_tab,
 ) = st.tabs(
     [
         "Executive overview",
@@ -827,6 +832,7 @@ m5.metric(
         "Fleet & port",
         "Contract optimizer",
         "Risk & explainability",
+        "System operations",
     ]
 )
 
@@ -1818,3 +1824,99 @@ with risk_tab:
             not from a UI-only rule.
             """
         )
+
+
+# ============================================================
+# SYSTEM OPERATIONS — ADDITIVE, DOES NOT ALTER EXISTING TABS
+# ============================================================
+
+with operations_tab:
+
+    st.subheader("System operations")
+    st.caption("Data lineage, model governance, recommendation audit trail and decision alerts.")
+
+    db_kind = "PostgreSQL" if database.url.startswith("postgresql") else "SQLite demo database"
+    o1, o2, o3 = st.columns(3)
+    o1.metric("Backend design", "FastAPI ready", "API service available")
+    o2.metric("Database", db_kind, "Persistent local history enabled")
+    o3.metric("Master data", f"{len(data):,} weeks", f"Latest: {data['date'].max():%d %b %Y}")
+
+    st.markdown("### Data health")
+    source_status = pd.DataFrame(
+        [
+            ["Freight", "🟡 Proxy", data["date"].max(), "Market proxy; replace with route-specific assessment"],
+            ["Coal", "🟢 Available", data["date"].max(), "World Bank Australian coal driver"],
+            ["Bunker", "🟡 Proxy", data["date"].max(), "Brent proxy; replace with VLSFO quote"],
+            ["USD/INR", "🟢 Available", data["date"].max(), "Weekly close from supplied raw feed"],
+            ["Port congestion", "🔴 Missing", "—", "Prototype default only; AIS/port feed needed"],
+        ],
+        columns=["Feed", "Status", "Latest observation", "Operational note"],
+    )
+    st.dataframe(source_status, width="stretch", hide_index=True)
+    st.caption(f"Active dataset: {provenance}")
+
+    st.markdown("### Model registry")
+    model_registry = metrics["comparison"].copy()
+    model_registry["Training rows"] = len(make_features(data))
+    model_registry["Status"] = model_registry["Model"].map(
+        lambda name: "ACTIVE" if name == selected_model else "TESTED"
+    )
+    st.dataframe(model_registry.style.format({"MAE": "${:.3f}/t", "RMSE": "${:.3f}/t"}), width="stretch", hide_index=True)
+
+    st.markdown("### Active alerts")
+    active_alerts = [
+        ("Data quality", "Medium", "Freight is a market proxy, not a route-specific India freight assessment."),
+        ("Data quality", "High", "Live port congestion is unavailable; the decision engine uses the prototype default."),
+    ]
+    if score >= 60:
+        active_alerts.append(("Risk", "High", f"Current charter risk is {label} ({score}/100). Confirm berth and broker quotes before award."))
+    if bunker_flip is not None and bunker_shock >= bunker_flip:
+        active_alerts.append(("Decision flip", "High", f"Bunker scenario crossed the +{bunker_flip:.1f}% decision-flip threshold. Re-evaluation recommended."))
+    if freight_flip is not None and freight_shock >= freight_flip:
+        active_alerts.append(("Decision flip", "High", f"Freight scenario crossed the +{freight_flip:.1f}% decision-flip threshold. Re-evaluation recommended."))
+    if congestion_flip is not None and congestion_shock >= congestion_flip:
+        active_alerts.append(("Decision flip", "High", f"Congestion scenario crossed the +{congestion_flip:.2f}-day decision-flip threshold. Re-evaluation recommended."))
+    st.dataframe(pd.DataFrame(active_alerts, columns=["Category", "Severity", "Alert"]), width="stretch", hide_index=True)
+
+    st.markdown("### Recommendation audit trail")
+    st.caption("Save the current recommendation to create a persistent, timestamped decision record.")
+    if st.button("Save current recommendation and alerts", type="primary"):
+        with database.session() as session:
+            for row in metrics["comparison"].to_dict("records"):
+                session.add(ModelRun(
+                    model_name=row["Model"], version=row["Version"], mae=float(row["MAE"]),
+                    rmse=float(row["RMSE"]), training_rows=len(make_features(data)),
+                    status="ACTIVE" if row["Model"] == selected_model else "TESTED",
+                ))
+            session.add(Recommendation(
+                destination_port=port_name, cargo_tonnes=analysis_cargo, horizon_weeks=horizon,
+                model_name=selected_model, vessel=vessel_name, contract=winner["contract"],
+                all_in_usd_per_tonne=float(winner["all_in_usd_per_tonne"]), risk_score=score,
+                risk_label=label, scenario_json=pd.Series(scenario).to_json(),
+            ))
+            for category, severity, message in active_alerts:
+                session.add(Alert(category=category, severity=severity, message=message))
+            session.commit()
+        st.success("Recommendation, model evaluation and current alerts were saved to the audit database.")
+
+    with database.session() as session:
+        saved_recommendations = session.scalars(select(Recommendation).order_by(desc(Recommendation.created_at)).limit(10)).all()
+        saved_alerts = session.scalars(select(Alert).order_by(desc(Alert.created_at)).limit(10)).all()
+
+    if saved_recommendations:
+        history = pd.DataFrame([
+            {"Created": item.created_at, "Port": item.destination_port, "Cargo (t)": item.cargo_tonnes,
+             "Model": item.model_name, "Vessel": item.vessel, "Contract": item.contract,
+             "All-in ($/t)": item.all_in_usd_per_tonne, "Risk": f"{item.risk_label} · {item.risk_score}/100"}
+            for item in saved_recommendations
+        ])
+        st.dataframe(history.style.format({"Cargo (t)": "{:,.0f}", "All-in ($/t)": "${:.2f}"}), width="stretch", hide_index=True)
+    else:
+        st.info("No saved recommendations yet. Use the button above to create the first audit record.")
+
+    if saved_alerts:
+        with st.expander("Saved alert history"):
+            st.dataframe(pd.DataFrame([
+                {"Created": item.created_at, "Category": item.category, "Severity": item.severity, "Alert": item.message}
+                for item in saved_alerts
+            ]), width="stretch", hide_index=True)

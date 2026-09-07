@@ -21,7 +21,7 @@ MODEL_VERSIONS = {
 }
 
 
-def make_features(data: pd.DataFrame) -> pd.DataFrame:
+def make_features(data: pd.DataFrame, require_target: bool = True) -> pd.DataFrame:
     frame = data.copy().sort_values("date")
     rate = frame["rate_usd_per_tonne"]
     frame["lag_1"] = rate.shift(1)
@@ -35,7 +35,13 @@ def make_features(data: pd.DataFrame) -> pd.DataFrame:
     frame["month"] = pd.to_datetime(frame["date"]).dt.month
     if "monsoon_indicator" not in frame:
         frame["monsoon_indicator"] = frame["month"].between(6, 9).astype(int)
-    return frame.dropna().reset_index(drop=True)
+    # Preserve optional provenance columns from a master dataset. They are
+    # intentionally absent from synthetic forecast rows and must not cause the
+    # final feature row to be discarded.
+    required = [*FEATURES]
+    if require_target:
+        required.insert(0, "rate_usd_per_tonne")
+    return frame.dropna(subset=required).reset_index(drop=True)
 
 
 def make_model(model_name: str):
@@ -61,9 +67,17 @@ def make_model(model_name: str):
     raise ValueError(f"Unknown model: {model_name}")
 
 
-def _single_model_backtest(frame: pd.DataFrame, model_name: str, min_train: int) -> dict:
+def _single_model_backtest(
+    frame: pd.DataFrame,
+    model_name: str,
+    min_train: int,
+    max_predictions: int | None = 60,
+) -> dict:
     predictions, actuals = [], []
-    for point in range(min_train, len(frame)):
+    first_point = min_train
+    if max_predictions is not None:
+        first_point = max(min_train, len(frame) - max_predictions)
+    for point in range(first_point, len(frame)):
         train, test = frame.iloc[:point], frame.iloc[[point]]
         model = make_model(model_name).fit(train[FEATURES], train["rate_usd_per_tonne"])
         predictions.append(float(model.predict(test[FEATURES])[0]))
@@ -83,7 +97,11 @@ def _single_model_backtest(frame: pd.DataFrame, model_name: str, min_train: int)
     }
 
 
-def backtest(data: pd.DataFrame, min_train: int = 52) -> dict:
+def backtest(
+    data: pd.DataFrame,
+    min_train: int = 52,
+    max_predictions: int | None = 60,
+) -> dict:
     """Expanding-window one-step backtest for Ridge and XGBoost.
 
     The model with the lower walk-forward MAE is selected for production forecasting.
@@ -93,8 +111,8 @@ def backtest(data: pd.DataFrame, min_train: int = 52) -> dict:
     if len(frame) <= min_train:
         raise ValueError("Not enough observations for the requested walk-forward backtest.")
 
-    ridge = _single_model_backtest(frame, "Ridge", min_train)
-    xgb = _single_model_backtest(frame, "XGBoost", min_train)
+    ridge = _single_model_backtest(frame, "Ridge", min_train, max_predictions)
+    xgb = _single_model_backtest(frame, "XGBoost", min_train, max_predictions)
     comparison = pd.DataFrame([
         {"Model": ridge["model"], "Version": ridge["version"], "MAE": ridge["mae"], "RMSE": ridge["rmse"]},
         {"Model": xgb["model"], "Version": xgb["version"], "MAE": xgb["mae"], "RMSE": xgb["rmse"]},
@@ -146,7 +164,9 @@ def forecast(
             "rate_usd_per_tonne": np.nan,
         }
         temporary = pd.concat([history, pd.DataFrame([next_row])], ignore_index=True)
-        featured = make_features(temporary)
+        # The row being predicted deliberately has no target yet. Retain it
+        # when calculating its lag-based feature vector.
+        featured = make_features(temporary, require_target=False)
         next_row["rate_usd_per_tonne"] = float(model.predict(featured.iloc[[-1]][FEATURES])[0])
         history = pd.concat([history, pd.DataFrame([next_row])], ignore_index=True)
         rows.append(next_row)
