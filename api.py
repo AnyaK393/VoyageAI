@@ -4,16 +4,17 @@ from __future__ import annotations
 
 import json
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import date, datetime
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import desc, select
 
-from maritime_ai.data import load_freight_data, ports, vessels
-from maritime_ai.database import Database, MarketObservation, ModelRun, Recommendation
+from maritime_ai.data import CARGO_TYPES, load_freight_data, ports, vessels
+from maritime_ai.database import BrokerTender, Database, MarketObservation, ModelRun, Recommendation
 from maritime_ai.forecast import backtest
 from maritime_ai.service import optimize_charter
+from maritime_ai.tenders import CONTRACT_VOYAGES, as_utc, rank_tenders
 
 
 class Scenario(BaseModel):
@@ -29,6 +30,20 @@ class OptimizeRequest(BaseModel):
     cargo_tonnes: int = Field(default=58000, ge=20000, le=180000)
     horizon_weeks: int = Field(default=12, ge=4, le=12)
     scenario: Scenario = Field(default_factory=Scenario)
+
+
+class TenderRequest(BaseModel):
+    broker_name: str = Field(min_length=2, max_length=120)
+    origin: str = Field(min_length=2, max_length=120)
+    destination_port: str
+    cargo_tonnes: int = Field(ge=20000, le=180000)
+    cargo_type: str = "Thermal coal"
+    laycan_start: date
+    vessel: str
+    contract: str
+    all_in_usd_per_tonne: float = Field(gt=0)
+    valid_until: date
+    notes: str = Field(default="", max_length=2000)
 
 
 def create_app(database_url: str | None = None) -> FastAPI:
@@ -111,6 +126,38 @@ def create_app(database_url: str | None = None) -> FastAPI:
     def decision_history():
         with database.session() as session:
             return [{"created_at": row.created_at, "destination_port": row.destination_port, "cargo_tonnes": row.cargo_tonnes, "model": row.model_name, "vessel": row.vessel, "contract": row.contract, "all_in_usd_per_tonne": row.all_in_usd_per_tonne, "risk_score": row.risk_score, "risk_label": row.risk_label, "scenario": json.loads(row.scenario_json)} for row in session.scalars(select(Recommendation).order_by(desc(Recommendation.created_at))).all()]
+
+    @app.post("/tenders", status_code=201)
+    def submit_tender(request: TenderRequest):
+        if request.contract not in CONTRACT_VOYAGES:
+            raise HTTPException(422, "Unknown contract type.")
+        if request.destination_port not in set(ports()["port"]):
+            raise HTTPException(422, "Unknown destination port.")
+        if request.cargo_type not in CARGO_TYPES:
+            raise HTTPException(422, "Unknown cargo type.")
+        if request.vessel not in set(vessels()["vessel"]):
+            raise HTTPException(422, "Unknown vessel.")
+        with database.session() as session:
+            tender = BrokerTender(
+                broker_name=request.broker_name, origin=request.origin,
+                destination_port=request.destination_port, cargo_tonnes=request.cargo_tonnes, cargo_type=request.cargo_type,
+                laycan_start=as_utc(request.laycan_start), vessel=request.vessel,
+                contract=request.contract, voyages=CONTRACT_VOYAGES[request.contract],
+                all_in_usd_per_tonne=request.all_in_usd_per_tonne,
+                valid_until=as_utc(request.valid_until), notes=request.notes,
+            )
+            session.add(tender); session.commit(); session.refresh(tender)
+            return {"id": tender.id, "status": tender.status}
+
+    @app.get("/tenders")
+    def list_tenders(destination_port: str = "Paradip", cargo_tonnes: int = 58000, cargo_type: str = "Thermal coal"):
+        if destination_port not in set(ports()["port"]):
+            raise HTTPException(422, "Unknown destination port.")
+        if cargo_type not in CARGO_TYPES:
+            raise HTTPException(422, "Unknown cargo type.")
+        with database.session() as session:
+            tenders = session.scalars(select(BrokerTender).order_by(desc(BrokerTender.created_at))).all()
+            return rank_tenders(tenders, destination_port, cargo_tonnes, cargo_type).to_dict(orient="records")
 
     return app
 

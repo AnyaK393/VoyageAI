@@ -23,6 +23,8 @@ Open **What-if scenario** in the sidebar and change bunker price, freight, coal,
 
 The dashboard also includes a **System operations** tab. Use it to show data health, the active Ridge/XGBoost model registry, data-gap and decision-flip alerts, and the persistent recommendation audit trail. Click **Save current recommendation and alerts** to record the current run locally.
 
+The **Tender desk** tab is a separate broker-quote workspace that does not alter the existing forecast dashboard. Add an all-in quote for Spot, 3-voyage or 6-voyage terms; VoyageAI ranks only offers that are still valid and feasible for the selected port and cargo. It is intentionally open in the prototype. Broker/admin permissions belong in the Supabase Auth deployment phase.
+
 ## Backend API and database
 
 The existing Streamlit dashboard is unchanged. A separate FastAPI backend now exposes the same model and optimizer plus data health, model registry and saved decision history.
@@ -38,7 +40,7 @@ export DATABASE_URL='postgresql://USER:PASSWORD@HOST:5432/postgres'
 venv/bin/uvicorn api:app --reload
 ```
 
-Core endpoints: `/health`, `/market/latest`, `/data-health`, `/ports`, `/vessels`, `/model-status`, `POST /models/evaluate`, `POST /optimize`, and `/decision-history`.
+Core endpoints: `/health`, `/market/latest`, `/data-health`, `/ports`, `/vessels`, `/model-status`, `POST /models/evaluate`, `POST /optimize`, `/decision-history`, `POST /tenders`, and `/tenders`.
 
 ## Important data note
 

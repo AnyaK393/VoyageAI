@@ -3,7 +3,7 @@ import pandas as pd
 import streamlit as st
 from datetime import date, timedelta
 
-from maritime_ai.data import load_freight_data, ports, vessels
+from maritime_ai.data import CARGO_TYPES, feasible_berths, load_freight_data, ports, vessels
 from maritime_ai.decision import (
     contract_options,
     feasibility,
@@ -11,8 +11,9 @@ from maritime_ai.decision import (
     find_decision_flip,
 )
 from maritime_ai.forecast import backtest, forecast, FEATURES, make_features, make_model
-from maritime_ai.database import Alert, Database, ModelRun, Recommendation
+from maritime_ai.database import Alert, BrokerTender, Database, ModelRun, Recommendation
 from sqlalchemy import desc, select
+from maritime_ai.tenders import CONTRACT_VOYAGES, as_utc, rank_tenders
 
 
 # ============================================================
@@ -302,6 +303,12 @@ with st.sidebar:
         port_table["port"].tolist(),
     )
 
+    cargo_type = st.selectbox(
+        "Cargo type",
+        CARGO_TYPES,
+        help="Tender and berth checks use this cargo type.",
+    )
+
     cargo = st.number_input(
         "Cargo per voyage (tonnes)",
         20000,
@@ -442,14 +449,19 @@ for _, candidate in vessel_table.iterrows():
         analysis_cargo,
     )
 
+    berth_matches = feasible_berths(port_name, cargo_type, candidate, analysis_cargo)
+    compatible_berths = berth_matches[berth_matches["feasible"]] if not berth_matches.empty else berth_matches
+    berth_pass = not compatible_berths.empty
+
     feasibility_rows.append(
         {
             "Vessel": candidate["vessel"],
             "Class": candidate["class"],
             "Capacity (t)": f"{candidate['capacity_tonnes']:,.0f}",
+            "Cargo berth": ", ".join(compatible_berths["berth"].tolist()) if berth_pass else "No compatible berth",
             "Decision": (
                 "✓ Eligible"
-                if result["feasible"]
+                if result["feasible"] and berth_pass
                 else "✕ Not eligible"
             ),
             "Constraint": (
@@ -458,7 +470,7 @@ for _, candidate in vessel_table.iterrows():
                     for k, passed in result["checks"].items()
                     if not passed
                 )
-                or "All checks passed"
+                or ("All port checks passed" if berth_pass else "No suitable cargo berth")
             ),
         }
     )
@@ -470,7 +482,7 @@ eligible_vessels = vessel_table[
             port,
             candidate,
             analysis_cargo,
-        )["feasible"],
+        )["feasible"] and not feasible_berths(port_name, cargo_type, candidate, analysis_cargo).query("feasible").empty,
         axis=1,
     )
 ].copy()
@@ -599,6 +611,7 @@ base_winner = base_options.iloc[0]
 vessel_name = winner["vessel"]
 
 vessel = eligible_vessels[eligible_vessels["vessel"] == vessel_name].iloc[0]
+winner_berths = feasible_berths(port_name, cargo_type, vessel, analysis_cargo)
 
 feasible_result = feasibility(
     port,
@@ -824,6 +837,7 @@ m5.metric(
     fleet_tab,
     contract_tab,
     risk_tab,
+    tender_tab,
     operations_tab,
 ) = st.tabs(
     [
@@ -832,6 +846,7 @@ m5.metric(
         "Fleet & port",
         "Contract optimizer",
         "Risk & explainability",
+        "Tender desk",
         "System operations",
     ]
 )
@@ -1133,8 +1148,7 @@ with fleet_tab:
     st.subheader("Vessel–port feasibility gate")
 
     st.caption(
-        "Candidates must pass draft, LOA, beam, port DWT "
-        "and cargo-capacity rules."
+        "Candidates must pass draft, LOA, beam, DWT, cargo capacity and at least one berth that handles the selected cargo."
     )
 
     st.dataframe(
@@ -1156,6 +1170,15 @@ with fleet_tab:
             rule,
             "PASS" if passed else "FAIL",
         )
+
+    st.markdown("#### Recommended vessel: compatible cargo berths")
+    if winner_berths.empty:
+        st.warning("No berth reference is available for this cargo type. This should not occur for an eligible vessel.")
+    else:
+        berth_display = winner_berths[["berth", "berth_id", "cargo_types", "max_draft_m", "max_loa_m", "max_beam_m", "data_status", "source", "feasible", "constraint"]].copy()
+        berth_display.columns = ["Berth", "Berth ID", "Cargo", "Draft (m)", "LOA (m)", "Beam (m)", "Data status", "Source", "Decision", "Validation"]
+        st.dataframe(berth_display, width="stretch", hide_index=True)
+        st.caption("Paradip berth geometry is a public reference; DWT and all non-Paradip berth records remain prototype reference data until dated terminal notices are connected.")
 
 
 # ============================================================
@@ -1829,6 +1852,57 @@ with risk_tab:
 # ============================================================
 # SYSTEM OPERATIONS — ADDITIVE, DOES NOT ALTER EXISTING TABS
 # ============================================================
+
+with tender_tab:
+
+    st.subheader("Broker Tender Desk")
+    st.caption("Submit comparable all-in broker tenders for the current voyage brief. Only valid, vessel-port feasible offers can be recommended.")
+    st.info("Prototype access is open for the demo. Broker identity and award permissions will be enforced with Supabase Auth in the next phase.")
+
+    with st.form("broker_tender_form", clear_on_submit=True):
+        t1, t2 = st.columns(2)
+        broker_name = t1.text_input("Broker / company name", placeholder="e.g. Meridian Shipbrokers")
+        tender_vessel = t2.selectbox("Offered vessel", vessel_table["vessel"].tolist())
+        t3, t4 = st.columns(2)
+        tender_contract = t3.selectbox("Contract term", list(CONTRACT_VOYAGES))
+        tender_rate = t4.number_input("All-in quoted rate (USD / tonne)", min_value=0.01, value=25.00, step=0.10)
+        t5, t6 = st.columns(2)
+        valid_until = t5.date_input("Quote valid until", value=date.today() + timedelta(days=7), min_value=date.today())
+        tender_notes = t6.text_input("Commercial notes", placeholder="Basis, exclusions, laycan terms")
+        submitted = st.form_submit_button("Submit broker tender", type="primary")
+
+    if submitted:
+        if not broker_name.strip():
+            st.error("Enter the broker or company name.")
+        else:
+            with database.session() as session:
+                session.add(BrokerTender(
+                    broker_name=broker_name.strip(), origin=origin, destination_port=port_name,
+                    cargo_tonnes=analysis_cargo, cargo_type=cargo_type, laycan_start=as_utc(laycan_start), vessel=tender_vessel,
+                    contract=tender_contract, voyages=CONTRACT_VOYAGES[tender_contract],
+                    all_in_usd_per_tonne=float(tender_rate), valid_until=as_utc(valid_until),
+                    notes=tender_notes.strip(),
+                ))
+                session.commit()
+            st.success("Tender saved. It is now included in the comparison below.")
+
+    with database.session() as session:
+        saved_tenders = session.scalars(select(BrokerTender).order_by(desc(BrokerTender.created_at)).limit(100)).all()
+    tender_ranking = rank_tenders(saved_tenders, port_name, analysis_cargo, cargo_type)
+
+    if tender_ranking.empty:
+        st.info("No broker tenders yet. Submit one above; the current forecast-based recommendation remains your planning reference.")
+    else:
+        eligible_tenders = tender_ranking[tender_ranking["eligible"]]
+        if not eligible_tenders.empty:
+            tender_winner = eligible_tenders.iloc[0]
+            st.success(f"Best valid tender: {tender_winner['broker']} — {tender_winner['vessel']} / {tender_winner['contract']} at ${tender_winner['all_in_usd_per_tonne']:.2f}/t.")
+        else:
+            st.warning("No tender is currently comparable. Review the validation reasons below.")
+        tender_view = tender_ranking[["broker", "vessel", "imo", "cargo_type", "berth", "contract", "voyages", "all_in_usd_per_tonne", "valid_until", "decision", "reason", "notes"]].copy()
+        tender_view.columns = ["Broker", "Vessel", "IMO", "Cargo", "Compatible berth", "Contract", "Voyages", "All-in ($/t)", "Valid until", "Decision", "Validation", "Notes"]
+        st.dataframe(tender_view.style.format({"All-in ($/t)": "${:.2f}"}), width="stretch", hide_index=True)
+        st.caption("A broker tender is treated as the submitted all-in commercial offer. VoyageAI does not add proxy discounts or invented costs to it.")
 
 with operations_tab:
 

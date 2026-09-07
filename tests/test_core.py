@@ -1,7 +1,10 @@
 import unittest
+from datetime import date, timedelta
 from maritime_ai.data import load_freight_data, ports, vessels
+from maritime_ai.database import BrokerTender
 from maritime_ai.forecast import backtest, forecast
 from maritime_ai.decision import feasibility, contract_options
+from maritime_ai.tenders import CONTRACT_VOYAGES, as_utc, rank_tenders
 
 
 class CoreTest(unittest.TestCase):
@@ -33,3 +36,26 @@ class CoreTest(unittest.TestCase):
         stressed_options = contract_options(stressed_forecast, vessel, 58000, scenario={"bunker_pct": 15})
         self.assertGreater(stressed_options["all_in_usd_per_tonne"].min(), base_options["all_in_usd_per_tonne"].min())
         self.assertGreater(stressed_options["risk_allowance_usd"].max(), 0)
+
+    def test_tender_ranking_rejects_infeasible_and_expired_offers(self):
+        today = date.today()
+        good = BrokerTender(id=1, broker_name="Broker A", origin="Indonesia", destination_port="Paradip", cargo_tonnes=58000, cargo_type="Thermal coal",
+                            laycan_start=as_utc(today), vessel="Supramax-58", contract="Spot (1 voyage)", voyages=1,
+                            all_in_usd_per_tonne=24.5, valid_until=as_utc(today + timedelta(days=3)), notes="", status="SUBMITTED")
+        expired = BrokerTender(id=2, broker_name="Broker B", origin="Indonesia", destination_port="Paradip", cargo_tonnes=58000, cargo_type="Thermal coal",
+                               laycan_start=as_utc(today), vessel="Supramax-58", contract="Spot (1 voyage)", voyages=1,
+                               all_in_usd_per_tonne=20, valid_until=as_utc(today - timedelta(days=1)), notes="", status="SUBMITTED")
+        ranking = rank_tenders([good, expired], "Paradip", 58000)
+        self.assertEqual(CONTRACT_VOYAGES["6-voyage contract"], 6)
+        self.assertEqual(ranking.iloc[0]["broker"], "Broker A")
+        self.assertTrue(ranking.iloc[0]["eligible"])
+        self.assertFalse(ranking.iloc[1]["eligible"])
+
+    def test_thermal_coal_tender_rejects_capesize_at_paradip_reference_berths(self):
+        today = date.today()
+        capesize_offer = BrokerTender(id=3, broker_name="Broker C", origin="Indonesia", destination_port="Paradip", cargo_tonnes=58000, cargo_type="Thermal coal",
+                                      laycan_start=as_utc(today), vessel="Capesize-180", contract="Spot (1 voyage)", voyages=1,
+                                      all_in_usd_per_tonne=19.0, valid_until=as_utc(today + timedelta(days=3)), notes="", status="SUBMITTED")
+        ranking = rank_tenders([capesize_offer], "Paradip", 58000, "Thermal coal")
+        self.assertFalse(ranking.iloc[0]["eligible"])
+        self.assertIn("No compatible cargo berth", ranking.iloc[0]["reason"])
