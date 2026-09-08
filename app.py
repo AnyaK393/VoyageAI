@@ -14,9 +14,9 @@ from maritime_ai.decision import (
     find_decision_flip,
 )
 from maritime_ai.forecast import backtest, forecast, FEATURES, make_features, make_model
-from maritime_ai.database import Alert, BrokerTender, Database, ModelRun, Recommendation
+from maritime_ai.database import Alert, BrokerTender, Database, ModelRun, Recommendation, TenderDecision
 from sqlalchemy import desc, select
-from maritime_ai.tenders import CONTRACT_VOYAGES, as_utc, rank_tenders
+from maritime_ai.tenders import CONTRACT_VOYAGES, TENDER_STATUSES, as_utc, rank_tenders
 
 
 # ============================================================
@@ -1925,10 +1925,76 @@ with tender_tab:
             st.success(f"Best valid tender: {tender_winner['broker']} — {tender_winner['vessel']} / {tender_winner['contract']} at ${tender_winner['all_in_usd_per_tonne']:.2f}/t.")
         else:
             st.warning("No tender is currently comparable. Review the validation reasons below.")
-        tender_view = tender_ranking[["broker", "vessel", "imo", "cargo_type", "berth", "contract", "voyages", "all_in_usd_per_tonne", "valid_until", "decision", "reason", "notes"]].copy()
-        tender_view.columns = ["Broker", "Vessel", "IMO", "Cargo", "Compatible berth", "Contract", "Voyages", "All-in ($/t)", "Valid until", "Decision", "Validation", "Notes"]
+        tender_view = tender_ranking[["id", "broker", "vessel", "imo", "cargo_type", "berth", "contract", "voyages", "all_in_usd_per_tonne", "valid_until", "status", "decision", "reason", "notes"]].copy()
+        tender_view.columns = ["Tender ID", "Broker", "Vessel", "IMO", "Cargo", "Compatible berth", "Contract", "Voyages", "All-in ($/t)", "Valid until", "Lifecycle", "Decision", "Validation", "Notes"]
         st.dataframe(tender_view.style.format({"All-in ($/t)": "${:.2f}"}), width="stretch", hide_index=True)
         st.caption("A broker tender is treated as the submitted all-in commercial offer. VoyageAI does not add proxy discounts or invented costs to it.")
+
+        tender_by_id = {item.id: item for item in saved_tenders}
+        tender_labels = {
+            int(row.id): f"#{int(row.id)} · {row.broker} · {row.vessel} · {row.contract}"
+            for row in tender_ranking.itertuples(index=False)
+        }
+
+        st.markdown("### Tender lifecycle")
+        st.caption("Shortlist a viable offer, or reject it with a recorded reason. Awarding is handled separately below.")
+        with st.form("tender_lifecycle_form"):
+            lifecycle_tender_id = st.selectbox("Tender", list(tender_labels), format_func=lambda tender_id: tender_labels[tender_id])
+            lifecycle_status = st.selectbox("Update lifecycle", ["SUBMITTED", "SHORTLISTED", "REJECTED"], format_func=lambda status: status.title())
+            lifecycle_actor = st.text_input("Buyer / analyst name", key="lifecycle_actor")
+            lifecycle_reason = st.text_area("Reason / note", placeholder="Required when rejecting a tender.", key="lifecycle_reason")
+            lifecycle_submit = st.form_submit_button("Save lifecycle update")
+        if lifecycle_submit:
+            if not lifecycle_actor.strip():
+                st.error("Enter the buyer or analyst name.")
+            elif lifecycle_status == "REJECTED" and not lifecycle_reason.strip():
+                st.error("A rejection reason is required.")
+            else:
+                with database.session() as session:
+                    tender = session.get(BrokerTender, lifecycle_tender_id)
+                    tender.status = lifecycle_status
+                    session.add(TenderDecision(tender_id=tender.id, action=lifecycle_status, actor_name=lifecycle_actor.strip(), reason=lifecycle_reason.strip()))
+                    session.commit()
+                st.success("Tender lifecycle updated.")
+                st.rerun()
+
+        st.markdown("### Buyer approval / override")
+        if eligible_tenders.empty:
+            st.info("A valid active tender is required before an award can be recorded.")
+        else:
+            approval_ids = [int(value) for value in eligible_tenders["id"].tolist()]
+            with st.form("tender_award_form"):
+                award_tender_id = st.selectbox("Tender to award", approval_ids, format_func=lambda tender_id: tender_labels[tender_id])
+                buyer_name = st.text_input("Approver name", key="award_actor")
+                override_reason = st.text_area("Override reason", placeholder="Required only if you award a tender other than VoyageAI's top valid recommendation.")
+                award_submit = st.form_submit_button("Approve and award tender", type="primary")
+            if award_submit:
+                top_tender_id = int(tender_winner["id"])
+                if not buyer_name.strip():
+                    st.error("Enter the approver name.")
+                elif award_tender_id != top_tender_id and not override_reason.strip():
+                    st.error("Enter an override reason before approving a non-recommended tender.")
+                else:
+                    with database.session() as session:
+                        tender = session.get(BrokerTender, award_tender_id)
+                        tender.status = "AWARDED"
+                        session.add(TenderDecision(
+                            tender_id=tender.id, action="AWARDED", actor_name=buyer_name.strip(),
+                            reason=override_reason.strip(), system_recommended=award_tender_id == top_tender_id,
+                        ))
+                        session.commit()
+                    st.success("Award saved to the tender audit trail.")
+                    st.rerun()
+
+        with database.session() as session:
+            tender_events = session.scalars(select(TenderDecision).order_by(desc(TenderDecision.created_at)).limit(12)).all()
+        if tender_events:
+            st.markdown("### Tender decision audit")
+            audit = pd.DataFrame([
+                {"Time": event.created_at, "Tender": tender_labels.get(event.tender_id, f"#{event.tender_id}"), "Action": event.action.title(), "Actor": event.actor_name, "Reason": event.reason or "—", "System recommendation": "Yes" if event.system_recommended else "No"}
+                for event in tender_events
+            ])
+            st.dataframe(audit, width="stretch", hide_index=True)
 
 with operations_tab:
 

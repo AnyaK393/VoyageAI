@@ -14,6 +14,8 @@ CONTRACT_VOYAGES = {
     "3-voyage contract": 3,
     "6-voyage contract": 6,
 }
+TENDER_STATUSES = ("SUBMITTED", "SHORTLISTED", "REJECTED", "AWARDED")
+ACTIVE_TENDER_STATUSES = {"SUBMITTED", "SHORTLISTED"}
 
 
 def as_utc(value: date | datetime) -> datetime:
@@ -35,7 +37,7 @@ def rank_tenders(tenders: list, destination_port: str, cargo_tonnes: float, carg
     for tender in tenders:
         reasons = []
         vessel = vessel_table.loc[tender.vessel] if tender.vessel in vessel_table.index else None
-        if tender.status != "SUBMITTED":
+        if tender.status not in ACTIVE_TENDER_STATUSES:
             reasons.append(f"Status: {tender.status.title()}")
         if as_utc(tender.valid_until) < now:
             reasons.append("Quote expired")
@@ -57,6 +59,7 @@ def rank_tenders(tenders: list, destination_port: str, cargo_tonnes: float, carg
             "id": tender.id, "broker": tender.broker_name, "vessel": tender.vessel,
             "imo": vessel["imo"] if vessel is not None else "—", "cargo_type": tender.cargo_type,
             "contract": tender.contract, "voyages": tender.voyages,
+            "status": tender.status,
             "all_in_usd_per_tonne": tender.all_in_usd_per_tonne,
             "valid_until": tender.valid_until, "notes": tender.notes,
             "eligible": eligible, "decision": "Eligible" if eligible else "Not comparable",

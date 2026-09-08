@@ -59,3 +59,11 @@ class CoreTest(unittest.TestCase):
         ranking = rank_tenders([capesize_offer], "Paradip", 58000, "Thermal coal")
         self.assertFalse(ranking.iloc[0]["eligible"])
         self.assertIn("No compatible cargo berth", ranking.iloc[0]["reason"])
+
+    def test_shortlisted_tender_remains_eligible_for_award(self):
+        today = date.today()
+        tender = BrokerTender(id=4, broker_name="Broker D", origin="Indonesia", destination_port="Paradip", cargo_tonnes=58000, cargo_type="Thermal coal",
+                              laycan_start=as_utc(today), vessel="Supramax-58", contract="Spot (1 voyage)", voyages=1,
+                              all_in_usd_per_tonne=24.0, valid_until=as_utc(today + timedelta(days=3)), notes="", status="SHORTLISTED")
+        ranking = rank_tenders([tender], "Paradip", 58000, "Thermal coal")
+        self.assertTrue(ranking.iloc[0]["eligible"])

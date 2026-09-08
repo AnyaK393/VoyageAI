@@ -130,6 +130,20 @@ class BrokerTender(Base):
     status: Mapped[str] = mapped_column(String(30), default="SUBMITTED", index=True)
 
 
+class TenderDecision(Base):
+    """Immutable audit entry for tender triage, approval, and overrides."""
+
+    __tablename__ = "tender_decisions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+    tender_id: Mapped[int] = mapped_column(Integer, index=True)
+    action: Mapped[str] = mapped_column(String(30), index=True)
+    actor_name: Mapped[str] = mapped_column(String(120))
+    reason: Mapped[str] = mapped_column(Text, default="")
+    system_recommended: Mapped[bool] = mapped_column(default=False)
+
+
 class Alert(Base):
     __tablename__ = "alerts"
 
@@ -219,6 +233,7 @@ class Database:
                 "model_runs": safe_count(ModelRun),
                 "recommendations": safe_count(Recommendation),
                 "broker_tenders": safe_count(BrokerTender),
+                "tender_decisions": safe_count(TenderDecision),
                 "alerts": safe_count(Alert),
             }
 

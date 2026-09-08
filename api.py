@@ -11,10 +11,10 @@ from pydantic import BaseModel, Field
 from sqlalchemy import desc, select
 
 from maritime_ai.data import CARGO_TYPES, load_freight_data, ports, vessels
-from maritime_ai.database import BrokerTender, Database, MarketObservation, ModelRun, Recommendation
+from maritime_ai.database import BrokerTender, Database, MarketObservation, ModelRun, Recommendation, TenderDecision
 from maritime_ai.forecast import backtest
 from maritime_ai.service import optimize_charter
-from maritime_ai.tenders import CONTRACT_VOYAGES, as_utc, rank_tenders
+from maritime_ai.tenders import CONTRACT_VOYAGES, TENDER_STATUSES, as_utc, rank_tenders
 
 
 class Scenario(BaseModel):
@@ -44,6 +44,18 @@ class TenderRequest(BaseModel):
     all_in_usd_per_tonne: float = Field(gt=0)
     valid_until: date
     notes: str = Field(default="", max_length=2000)
+
+
+class TenderStatusRequest(BaseModel):
+    status: str
+    actor_name: str = Field(min_length=2, max_length=120)
+    reason: str = Field(default="", max_length=2000)
+
+
+class TenderAwardRequest(BaseModel):
+    tender_id: int
+    buyer_name: str = Field(min_length=2, max_length=120)
+    override_reason: str = Field(default="", max_length=2000)
 
 
 def create_app(database_url: str | None = None) -> FastAPI:
@@ -147,6 +159,50 @@ def create_app(database_url: str | None = None) -> FastAPI:
         with database.session() as session:
             tenders = session.scalars(select(BrokerTender).order_by(desc(BrokerTender.created_at))).all()
             return rank_tenders(tenders, destination_port, cargo_tonnes, cargo_type).to_dict(orient="records")
+
+    @app.patch("/tenders/{tender_id}/status")
+    def update_tender_status(tender_id: int, request: TenderStatusRequest):
+        status = request.status.upper()
+        if status not in TENDER_STATUSES or status == "AWARDED":
+            raise HTTPException(422, "Use Submitted, Shortlisted or Rejected here; award through /tenders/award.")
+        if status == "REJECTED" and not request.reason.strip():
+            raise HTTPException(422, "A rejection reason is required.")
+        with database.session() as session:
+            tender = session.get(BrokerTender, tender_id)
+            if tender is None:
+                raise HTTPException(404, "Tender not found.")
+            tender.status = status
+            session.add(TenderDecision(tender_id=tender.id, action=status, actor_name=request.actor_name.strip(), reason=request.reason.strip()))
+            session.commit()
+            return {"id": tender.id, "status": tender.status}
+
+    @app.post("/tenders/award")
+    def award_tender(request: TenderAwardRequest):
+        with database.session() as session:
+            tender = session.get(BrokerTender, request.tender_id)
+            if tender is None:
+                raise HTTPException(404, "Tender not found.")
+            tenders = session.scalars(select(BrokerTender).order_by(desc(BrokerTender.created_at))).all()
+            ranking = rank_tenders(tenders, tender.destination_port, tender.cargo_tonnes, tender.cargo_type)
+            selected = ranking[ranking["id"] == tender.id]
+            if selected.empty or not bool(selected.iloc[0]["eligible"]):
+                raise HTTPException(422, "Only a valid, feasible active tender can be awarded.")
+            best_id = int(ranking[ranking["eligible"]].iloc[0]["id"])
+            is_recommended = tender.id == best_id
+            if not is_recommended and not request.override_reason.strip():
+                raise HTTPException(422, "An override reason is required when awarding a non-recommended tender.")
+            tender.status = "AWARDED"
+            session.add(TenderDecision(tender_id=tender.id, action="AWARDED", actor_name=request.buyer_name.strip(), reason=request.override_reason.strip(), system_recommended=is_recommended))
+            session.commit()
+            return {"id": tender.id, "status": tender.status, "system_recommended": is_recommended}
+
+    @app.get("/tenders/{tender_id}/decisions")
+    def tender_decisions(tender_id: int):
+        with database.session() as session:
+            if session.get(BrokerTender, tender_id) is None:
+                raise HTTPException(404, "Tender not found.")
+            events = session.scalars(select(TenderDecision).where(TenderDecision.tender_id == tender_id).order_by(desc(TenderDecision.created_at))).all()
+            return [{"created_at": event.created_at, "action": event.action, "actor_name": event.actor_name, "reason": event.reason, "system_recommended": event.system_recommended} for event in events]
 
     return app
 
